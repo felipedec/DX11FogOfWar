@@ -1,0 +1,170 @@
+﻿// MIT License
+// 
+// Copyright (c) 2017 Felipe Marques de Carvalho de Oliveira
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+/*----------------------------------------------------------------------------
+            Kernels.
+----------------------------------------------------------------------------*/
+
+#pragma kernel RenderSightMain
+#pragma kernel ClearMaskMain
+
+/*----------------------------------------------------------------------------
+            Macros.
+----------------------------------------------------------------------------*/
+
+#define OBSTACLE_THRESHOLD 0.5f
+
+/*----------------------------------------------------------------------------
+            Textures.
+----------------------------------------------------------------------------*/
+
+Texture2D<float4> TemporalMaskTexture;
+Texture2D<float4> NavigationMaskTexture;
+RWTexture2D<float4> RawMaskTexture;
+
+/*----------------------------------------------------------------------------
+            Buffers.
+----------------------------------------------------------------------------*/
+
+Buffer<float2> EyesightWorldPositions;
+Buffer<int> EyesightRanges;
+
+/*----------------------------------------------------------------------------
+            Properties.
+----------------------------------------------------------------------------*/
+
+float3 Offset;
+float Scale;
+float TemporalAmount;
+
+/*----------------------------------------------------------------------------
+            Forward declarions.
+----------------------------------------------------------------------------*/
+
+inline bool HasObstacleAt(const int2 Coordinate);
+inline int2 WorldPositionToCoordinate(const float3 Position);
+
+/*----------------------------------------------------------------------------
+            Bresenham's line algorithm for each octane implementation.
+
+            The diference between my implementation and Bresenham implementation
+            is that I'm implementing for each octane a method that rasterize a
+            line from a origin instead of his implementation where the line
+            always come from the lowest point.
+----------------------------------------------------------------------------*/
+
+#define IMPLEMENT_DLOS_OCTANE(Octane, U, V, CompareOperation, IncrementationOperation, ThresholdOperation)\
+inline void DrawLineOfSightOctane ## Octane(int2 Origin, const int2 Line)\
+{\
+	int2 To = Origin + Line;\
+	int2 Delta = abs(To - Origin);\
+	Delta.U *= 2;\
+	int Offset = 0;\
+	int Threshold = Delta.V;\
+	int ThresholdIncrease = Delta.V * 2;\
+	for (; Origin.V CompareOperation To.V && !HasObstacleAt(Origin); Origin.V IncrementationOperation)\
+	{\
+		RawMaskTexture[Origin] = float4(1, 1, 1, 1);\
+		Offset += Delta.U;\
+		if (Offset >= Threshold)\
+		{\
+			Origin.U ThresholdOperation;\
+			Threshold = Threshold + ThresholdIncrease;\
+		}\
+	}\
+}\
+
+IMPLEMENT_DLOS_OCTANE(0, y, x, <=, ++, ++);
+IMPLEMENT_DLOS_OCTANE(1, x, y, <=, ++, ++);
+IMPLEMENT_DLOS_OCTANE(2, x, y, <=, ++, --);
+IMPLEMENT_DLOS_OCTANE(3, y, x, >=, --, ++);
+IMPLEMENT_DLOS_OCTANE(4, y, x, >=, --, --);
+IMPLEMENT_DLOS_OCTANE(5, x, y, >=, --, --);
+IMPLEMENT_DLOS_OCTANE(6, x, y, >=, --, ++);
+IMPLEMENT_DLOS_OCTANE(7, y, x, <=, ++, --);
+
+/*----------------------------------------------------------------------------
+            Inline Methods.
+----------------------------------------------------------------------------*/
+
+inline int2 WorldPositionToCoordinate(const float2 Position)
+{
+    return int2(round((Position - Offset.xz) / Scale));
+}
+
+inline bool HasObstacleAt(const int2 Coordinate)
+{
+    return NavigationMaskTexture[Coordinate].a <= OBSTACLE_THRESHOLD;
+}
+
+/*----------------------------------------------------------------------------
+            Kernel Methods.
+----------------------------------------------------------------------------*/
+
+[numthreads(64, 1, 1)]
+void RenderSightMain(uint id : SV_DispatchThreadID)
+{
+    if (EyesightRanges[id] <= 0)
+    {
+        return;
+    }
+
+    int Radius = EyesightRanges[id] / Scale;
+    int2 Coordinate = WorldPositionToCoordinate(EyesightWorldPositions[id]);
+
+    int AxisX = Radius - 1;
+    int AxisY = 0;
+    int2 Delta = int2(1, 1);
+    int Error = Delta.x - (Radius << 1);
+
+    while (AxisX >= AxisY)
+    {
+        DrawLineOfSightOctane0(Coordinate, int2(AxisX, AxisY));
+        DrawLineOfSightOctane1(Coordinate, int2(AxisY, AxisX));
+        DrawLineOfSightOctane2(Coordinate, int2(-AxisY, AxisX));
+        DrawLineOfSightOctane3(Coordinate, int2(-AxisX, AxisY));
+        DrawLineOfSightOctane4(Coordinate, int2(-AxisX, -AxisY));
+        DrawLineOfSightOctane5(Coordinate, int2(-AxisY, -AxisX));
+        DrawLineOfSightOctane6(Coordinate, int2(AxisY, -AxisX));
+        DrawLineOfSightOctane7(Coordinate, int2(AxisX, -AxisY));
+
+        if (Error <= 0)
+        {
+            AxisY++;
+            Error += Delta.y;
+            Delta.y += 2;
+        }
+        else
+        {
+            AxisX--;
+            Error += (-Radius << 1) + Delta.x;
+            Delta.x += 2;
+        }
+    }
+    
+}
+
+[numthreads(8, 8, 1)]
+void ClearMaskMain(uint2 id : SV_DispatchThreadID)
+{
+    RawMaskTexture[id] = max(float4(0, 0, 0, 0), TemporalMaskTexture[id] - float4(1, 1, 1, 1) * (1 - TemporalAmount));
+}
